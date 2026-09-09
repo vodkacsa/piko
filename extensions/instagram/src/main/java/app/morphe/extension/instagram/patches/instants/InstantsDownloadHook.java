@@ -1,17 +1,14 @@
 package app.morphe.extension.instagram.patches.instants;
 
-import android.app.Activity;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.View;
-import android.view.ViewTreeObserver;
+import android.view.Window;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.WeakHashMap;
 
@@ -21,12 +18,12 @@ import app.morphe.extension.instagram.constants.UI;
 import app.morphe.extension.instagram.entity.MediaData;
 import app.morphe.extension.instagram.patches.download.DownloadUtils;
 import app.morphe.extension.shared.Logger;
-import app.morphe.extension.shared.Utils;
 import app.morphe.extension.shared.ui.Dim;
 
 @SuppressWarnings("unused")
 public final class InstantsDownloadHook {
-    private static final long BYPASS_TIMEOUT_MS = 10 * 60_000L;
+    private static final long INSTANT_MATCH_WINDOW_MS = 60_000L;
+    private static final long BUTTON_FALLBACK_HIDE_MS = 120_000L;
 
     private static volatile String currentId;
     private static volatile String currentUsername;
@@ -36,7 +33,8 @@ public final class InstantsDownloadHook {
 
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Map<View, ImageView> buttons = new WeakHashMap<>();
-    private static final Map<View, ViewTreeObserver.OnPreDrawListener> secureListeners = new WeakHashMap<>();
+    private static final ThreadLocal<Boolean> secureFlagAttempt = new ThreadLocal<>();
+    private static final ThreadLocal<Boolean> secureFlagClear = new ThreadLocal<>();
 
     public static void noteInstantMedia(Object media) {
         try {
@@ -57,49 +55,102 @@ public final class InstantsDownloadHook {
             currentUrl = url;
             currentUsername = safeStr(() -> md.getUserData().getUsername());
             lastInstantSeenAt = System.currentTimeMillis();
-
-            installOnCurrentActivityWithRetry(0);
         } catch (Throwable t) {
-            Logger.printException(() -> "Instant hook failed", t);
+            Logger.printException(() -> "Instant media hook failed", t);
         }
     }
 
-    private static void installOnCurrentActivityWithRetry(int attempt) {
-        MAIN.post(() -> {
-            try {
-                Activity activity = findCurrentActivity();
-                if (activity != null) {
-                    installInstantControls(activity);
-                } else if (attempt < 8) {
-                    installOnCurrentActivityWithRetry(attempt + 1);
-                }
-            } catch (Throwable t) {
-                Logger.printException(() -> "Instant controls retry failed", t);
-            }
-        });
+    /**
+     * Called immediately before Instagram calls Window.addFlags/setFlags.
+     * FLAG_SECURE is removed before Android receives it, matching the strategy
+     * used by InstaEclipse's screenshot-permission hook.
+     */
+    public static int stripSecureFlag(int flags) {
+        boolean hadSecure = (flags & WindowManager.LayoutParams.FLAG_SECURE) != 0;
+        secureFlagAttempt.set(hadSecure);
+        return flags & ~WindowManager.LayoutParams.FLAG_SECURE;
     }
 
-    private static void installInstantControls(Activity activity) {
+    /** Called with the exact Window on which Instagram attempted to set flags. */
+    public static void noteWindowFlagCall(Window window) {
         try {
-            View decor = activity.getWindow().getDecorView();
+            boolean attemptedSecure = Boolean.TRUE.equals(secureFlagAttempt.get());
+            secureFlagAttempt.remove();
+            if (!attemptedSecure || window == null) return;
+
+            long mediaAge = System.currentTimeMillis() - lastInstantSeenAt;
+            if (currentUrl == null || mediaAge < 0 || mediaAge > INSTANT_MATCH_WINDOW_MS) return;
+
+            // The secure flag is normally applied as the Instants viewer window opens.
+            // Wait one frame so its own content is attached, then place our control on
+            // that exact window rather than on Instagram's always-present activity.
+            MAIN.postDelayed(() -> installInstantControls(window), 80L);
+        } catch (Throwable t) {
+            Logger.printException(() -> "Instant secure-window hook failed", t);
+        }
+    }
+
+    public static void noteClearFlag(int flags) {
+        secureFlagClear.set((flags & WindowManager.LayoutParams.FLAG_SECURE) != 0);
+    }
+
+    public static void noteWindowClearCall(Window window) {
+        try {
+            boolean clearingSecure = Boolean.TRUE.equals(secureFlagClear.get());
+            secureFlagClear.remove();
+            if (clearingSecure && window != null) hideInstantControls(window);
+        } catch (Throwable t) {
+            Logger.printException(() -> "Instant clear-window hook failed", t);
+        }
+    }
+
+    private static void installInstantControls(Window window) {
+        try {
+            View decor = window.getDecorView();
             if (!(decor instanceof FrameLayout)) return;
 
             FrameLayout root = (FrameLayout) decor;
+            ImageView button;
             synchronized (buttons) {
-                ImageView button = buttons.get(root);
+                button = buttons.get(root);
                 if (button == null) {
                     button = createDownloadButton(root);
-                    if (button != null) buttons.put(root, button);
-                } else {
-                    button.setVisibility(View.VISIBLE);
+                    if (button == null) return;
+                    buttons.put(root, button);
                 }
+                button.setVisibility(View.VISIBLE);
             }
 
-            activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
-            installSecureFlagBypass(activity, root);
+            // The Instants viewer can add its own full-screen child after the media
+            // object is created. High Z + bringToFront keeps the button above it.
+            button.setElevation(10_000f);
+            button.bringToFront();
+
+            final ImageView finalButton = button;
+            MAIN.postDelayed(() -> {
+                try {
+                    if (System.currentTimeMillis() - lastInstantSeenAt >= BUTTON_FALLBACK_HIDE_MS) {
+                        finalButton.setVisibility(View.GONE);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }, BUTTON_FALLBACK_HIDE_MS);
         } catch (Throwable t) {
             Logger.printException(() -> "Instant controls setup failed", t);
         }
+    }
+
+    private static void hideInstantControls(Window window) {
+        MAIN.post(() -> {
+            try {
+                View decor = window.getDecorView();
+                synchronized (buttons) {
+                    ImageView button = buttons.get(decor);
+                    if (button != null) button.setVisibility(View.GONE);
+                }
+            } catch (Throwable ignored) {
+            }
+        });
     }
 
     private static ImageView createDownloadButton(FrameLayout root) {
@@ -117,44 +168,15 @@ public final class InstantsDownloadHook {
             );
             lp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
             lp.topMargin = getStatusBarHeight(context) + (Dim.dp16 / 4);
-            // The native grid + camera controls are on the far right.
-            // Place the download control immediately to their left.
             lp.rightMargin = Dim.dp16 * 7;
 
             root.addView(button, lp);
+            button.setElevation(10_000f);
+            button.bringToFront();
             return button;
         } catch (Throwable t) {
             Logger.printException(() -> "Failed to add Instant download button", t);
             return null;
-        }
-    }
-
-    private static void installSecureFlagBypass(Activity activity, View root) {
-        synchronized (secureListeners) {
-            if (secureListeners.containsKey(root)) return;
-
-            final ViewTreeObserver.OnPreDrawListener[] holder = new ViewTreeObserver.OnPreDrawListener[1];
-            holder[0] = () -> {
-                try {
-                    long age = System.currentTimeMillis() - lastInstantSeenAt;
-                    if (age <= BYPASS_TIMEOUT_MS) {
-                        activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
-                        return true;
-                    }
-
-                    ViewTreeObserver vto = root.getViewTreeObserver();
-                    if (vto.isAlive()) vto.removeOnPreDrawListener(holder[0]);
-                    synchronized (secureListeners) {
-                        secureListeners.remove(root);
-                    }
-                } catch (Throwable ignored) {
-                    // Do not break Instagram rendering if the window implementation changes.
-                }
-                return true;
-            };
-
-            secureListeners.put(root, holder[0]);
-            root.getViewTreeObserver().addOnPreDrawListener(holder[0]);
         }
     }
 
@@ -186,39 +208,6 @@ public final class InstantsDownloadHook {
         } catch (Throwable ignored) {
             return 0;
         }
-    }
-
-    private static Activity findCurrentActivity() {
-        try {
-            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
-            Method currentActivityThread = activityThreadClass.getDeclaredMethod("currentActivityThread");
-            currentActivityThread.setAccessible(true);
-            Object activityThread = currentActivityThread.invoke(null);
-            if (activityThread == null) return null;
-
-            Field activitiesField = activityThreadClass.getDeclaredField("mActivities");
-            activitiesField.setAccessible(true);
-            Object activitiesObject = activitiesField.get(activityThread);
-            if (!(activitiesObject instanceof Map)) return null;
-
-            for (Object record : ((Map<?, ?>) activitiesObject).values()) {
-                try {
-                    Field pausedField = record.getClass().getDeclaredField("paused");
-                    pausedField.setAccessible(true);
-                    if (pausedField.getBoolean(record)) continue;
-
-                    Field activityField = record.getClass().getDeclaredField("activity");
-                    activityField.setAccessible(true);
-                    Object activity = activityField.get(record);
-                    if (activity instanceof Activity) return (Activity) activity;
-                } catch (Throwable ignored) {
-                    // Try the next record.
-                }
-            }
-        } catch (Throwable ignored) {
-            // Hidden API access can be restricted on some Android builds.
-        }
-        return null;
     }
 
     private interface StrCall { String get() throws Exception; }
