@@ -5,7 +5,6 @@ import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.View;
-import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
@@ -27,7 +26,6 @@ import app.morphe.extension.shared.ui.Dim;
 
 @SuppressWarnings("unused")
 public final class InstantsDownloadHook {
-    private static final String BUTTON_TAG = "piko_instants_download_button";
     private static final long BYPASS_TIMEOUT_MS = 10 * 60_000L;
 
     private static volatile String currentId;
@@ -110,7 +108,6 @@ public final class InstantsDownloadHook {
             ImageView button = new ImageView(context);
             UI.setThemedIcon(button, UI.DRAWABLE_DOWNLOAD_ICON);
             button.setContentDescription("Download Instant");
-            button.setTag(BUTTON_TAG);
             button.setPadding(Dim.dp12, Dim.dp12, Dim.dp12, Dim.dp12);
             button.setOnClickListener(v -> downloadCurrentInstant(v.getContext()));
 
@@ -119,9 +116,9 @@ public final class InstantsDownloadHook {
                     Dim.dp16 * 3
             );
             lp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
-            lp.topMargin = getStatusBarHeight(context) + Dim.dp4;
-            // Instagram's native grid + camera controls occupy the right side.
-            // This puts the download control immediately to their left.
+            lp.topMargin = getStatusBarHeight(context) + (Dim.dp16 / 4);
+            // The native grid + camera controls are on the far right.
+            // Place the download control immediately to their left.
             lp.rightMargin = Dim.dp16 * 7;
 
             root.addView(button, lp);
