@@ -23,6 +23,8 @@ jobs:
         uses: burrunan/gradle-cache-action@v3
 
       - name: Build Piko patches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew clean buildAndroid
 
       - name: Create test release
