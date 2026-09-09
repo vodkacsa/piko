@@ -35,3 +35,5 @@ jobs:
           generate_release_notes: true
           files: patches/build/libs/*.mpp
           fail_on_unmatched_files: true
+
+# Test release workflow for the Instant patch.
