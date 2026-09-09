@@ -16,7 +16,7 @@ private const val HOOK = "Lapp/morphe/extension/instagram/patches/instants/Insta
 @Suppress("unused")
 val instantsDownloadPatch = bytecodePatch(
     name = "Download Instants",
-    description = "Automatically saves received Instants when they are opened.",
+    description = "Adds a download button to the Instants viewer and allows screenshots/screen recording there.",
 ) {
     dependsOn(decoderEntity)
     compatibleWith(COMPATIBILITY_INSTAGRAM)
