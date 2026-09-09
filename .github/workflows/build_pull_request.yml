@@ -1,4 +1,4 @@
-name: Test pull request
+name: Build Piko patches
 
 on:
   workflow_dispatch:
@@ -6,20 +6,18 @@ on:
     branches:
       - main
       - dev
-      
+
 permissions:
   contents: read
 
 jobs:
-  release:
-    name: Test pull request
+  build:
+    name: Build Piko patches
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          # Make sure the release step uses its own credentials:
-          # https://github.com/cycjimmy/semantic-release-action#private-packages
           persist-credentials: false
           fetch-depth: 0
 
@@ -27,6 +25,11 @@ jobs:
         uses: burrunan/gradle-cache-action@v3
 
       - name: Build with Gradle
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew clean buildAndroid
+
+      - name: Upload patch files
+        uses: actions/upload-artifact@v4
+        with:
+          name: piko-patches
+          path: patches/build/libs/*.mpp
+          if-no-files-found: error
