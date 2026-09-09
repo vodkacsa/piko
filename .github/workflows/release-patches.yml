@@ -1,0 +1,37 @@
+name: Release Piko patches
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'release:')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Cache Gradle
+        uses: burrunan/gradle-cache-action@v3
+
+      - name: Build Piko patches
+        run: ./gradlew clean buildAndroid
+
+      - name: Create test release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: piko-instant-test-${{ github.run_number }}
+          name: Piko Instant patch test ${{ github.run_number }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          files: patches/build/libs/*.mpp
+          fail_on_unmatched_files: true
