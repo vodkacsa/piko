@@ -2,7 +2,8 @@ package app.morphe.extension.instagram.patches.instants;
 
 import android.app.Activity;
 import android.content.Context;
-import android.graphics.drawable.Drawable;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
@@ -27,15 +28,15 @@ import app.morphe.extension.shared.ui.Dim;
 @SuppressWarnings("unused")
 public final class InstantsDownloadHook {
     private static final String BUTTON_TAG = "piko_instants_download_button";
-    private static final long BYPASS_TIMEOUT_MS = 60_000L;
+    private static final long BYPASS_TIMEOUT_MS = 10 * 60_000L;
 
-    private static volatile MediaData currentMedia;
     private static volatile String currentId;
     private static volatile String currentUsername;
     private static volatile boolean currentVideo;
     private static volatile String currentUrl;
     private static volatile long lastInstantSeenAt;
 
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Map<View, ImageView> buttons = new WeakHashMap<>();
     private static final Map<View, ViewTreeObserver.OnPreDrawListener> secureListeners = new WeakHashMap<>();
 
@@ -53,35 +54,44 @@ public final class InstantsDownloadHook {
                     : safeStr(() -> md.getImageLink());
             if (url == null || !url.startsWith("http")) return;
 
-            currentMedia = md;
             currentId = id;
             currentVideo = video;
             currentUrl = url;
             currentUsername = safeStr(() -> md.getUserData().getUsername());
             lastInstantSeenAt = System.currentTimeMillis();
 
-            Activity activity = findCurrentActivity();
-            if (activity != null) {
-                installInstantControls(activity);
-            }
+            installOnCurrentActivityWithRetry(0);
         } catch (Throwable t) {
             Logger.printException(() -> "Instant hook failed", t);
         }
     }
 
+    private static void installOnCurrentActivityWithRetry(int attempt) {
+        MAIN.post(() -> {
+            try {
+                Activity activity = findCurrentActivity();
+                if (activity != null) {
+                    installInstantControls(activity);
+                } else if (attempt < 8) {
+                    installOnCurrentActivityWithRetry(attempt + 1);
+                }
+            } catch (Throwable t) {
+                Logger.printException(() -> "Instant controls retry failed", t);
+            }
+        });
+    }
+
     private static void installInstantControls(Activity activity) {
         try {
-            final View decor = activity.getWindow().getDecorView();
-            if (!(decor instanceof ViewGroup)) return;
+            View decor = activity.getWindow().getDecorView();
+            if (!(decor instanceof FrameLayout)) return;
 
-            final ViewGroup root = (ViewGroup) decor;
+            FrameLayout root = (FrameLayout) decor;
             synchronized (buttons) {
                 ImageView button = buttons.get(root);
                 if (button == null) {
                     button = createDownloadButton(root);
-                    if (button != null) {
-                        buttons.put(root, button);
-                    }
+                    if (button != null) buttons.put(root, button);
                 } else {
                     button.setVisibility(View.VISIBLE);
                 }
@@ -94,7 +104,7 @@ public final class InstantsDownloadHook {
         }
     }
 
-    private static ImageView createDownloadButton(ViewGroup root) {
+    private static ImageView createDownloadButton(FrameLayout root) {
         try {
             Context context = root.getContext();
             ImageView button = new ImageView(context);
@@ -102,16 +112,17 @@ public final class InstantsDownloadHook {
             button.setContentDescription("Download Instant");
             button.setTag(BUTTON_TAG);
             button.setPadding(Dim.dp12, Dim.dp12, Dim.dp12, Dim.dp12);
-            button.setBackgroundResource(android.R.drawable.btn_default);
             button.setOnClickListener(v -> downloadCurrentInstant(v.getContext()));
 
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                    Dim.dp48,
-                    Dim.dp48
+                    Dim.dp16 * 3,
+                    Dim.dp16 * 3
             );
             lp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
             lp.topMargin = getStatusBarHeight(context) + Dim.dp4;
-            lp.rightMargin = Dim.dp112;
+            // Instagram's native grid + camera controls occupy the right side.
+            // This puts the download control immediately to their left.
+            lp.rightMargin = Dim.dp16 * 7;
 
             root.addView(button, lp);
             return button;
@@ -125,7 +136,8 @@ public final class InstantsDownloadHook {
         synchronized (secureListeners) {
             if (secureListeners.containsKey(root)) return;
 
-            final ViewTreeObserver.OnPreDrawListener listener = () -> {
+            final ViewTreeObserver.OnPreDrawListener[] holder = new ViewTreeObserver.OnPreDrawListener[1];
+            holder[0] = () -> {
                 try {
                     long age = System.currentTimeMillis() - lastInstantSeenAt;
                     if (age <= BYPASS_TIMEOUT_MS) {
@@ -134,26 +146,18 @@ public final class InstantsDownloadHook {
                     }
 
                     ViewTreeObserver vto = root.getViewTreeObserver();
-                    if (vto.isAlive()) {
-                        vto.removeOnPreDrawListener(thisListener(root));
-                    }
+                    if (vto.isAlive()) vto.removeOnPreDrawListener(holder[0]);
                     synchronized (secureListeners) {
                         secureListeners.remove(root);
                     }
                 } catch (Throwable ignored) {
-                    // Keep the viewer usable even if a vendor window implementation is unusual.
+                    // Do not break Instagram rendering if the window implementation changes.
                 }
                 return true;
             };
 
-            secureListeners.put(root, listener);
-            root.getViewTreeObserver().addOnPreDrawListener(listener);
-        }
-    }
-
-    private static ViewTreeObserver.OnPreDrawListener thisListener(View root) {
-        synchronized (secureListeners) {
-            return secureListeners.get(root);
+            secureListeners.put(root, holder[0]);
+            root.getViewTreeObserver().addOnPreDrawListener(holder[0]);
         }
     }
 
