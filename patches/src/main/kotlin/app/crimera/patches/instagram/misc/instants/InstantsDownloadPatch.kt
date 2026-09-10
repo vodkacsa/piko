@@ -1,6 +1,7 @@
 package app.crimera.patches.instagram.misc.instants
 
 import app.crimera.patches.instagram.entity.decoder.decoderEntity
+import app.crimera.patches.instagram.misc.privacy.disableScreenshotDetection
 import app.crimera.patches.instagram.utils.Constants.COMPATIBILITY_INSTAGRAM
 import app.morphe.patcher.extensions.InstructionExtensions.addInstruction
 import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
@@ -28,7 +29,9 @@ val instantsDownloadPatch = bytecodePatch(
     name = "Download Instants",
     description = "Adds a download button to the Instants viewer and allows screenshots/screen recording there.",
 ) {
-    dependsOn(decoderEntity)
+    // Piko's own screenshot patch fingerprints Instagram's internal FLAG_SECURE controller.
+    // Depending on it is much more reliable than relying only on framework call-site matching.
+    dependsOn(decoderEntity, disableScreenshotDetection)
     compatibleWith(COMPATIBILITY_INSTAGRAM)
     execute {
         runCatching {
@@ -37,6 +40,8 @@ val instantsDownloadPatch = bytecodePatch(
                 0, "invoke-static {p1}, $HOOK->noteInstantMedia(Ljava/lang/Object;)V"
             )
 
+            // Keep these as a second line of defence for builds that protect an Instant
+            // with a direct Window or secure Surface call.
             val windowCalls = patchWindowSecureFlagCalls()
             val surfaceCalls = patchSecureSurfaceCalls()
             println("[piko] Instants: patched $windowCalls Window calls and $surfaceCalls secure-surface calls")
