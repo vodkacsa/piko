@@ -2,29 +2,34 @@ package app.morphe.extension.instagram.patches.instants;
 
 import android.app.Activity;
 import android.content.Context;
+import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.Gravity;
 import android.view.View;
+import android.view.ViewTreeObserver;
 import android.view.WindowManager;
-import android.widget.FrameLayout;
 import android.widget.ImageView;
+import android.widget.PopupWindow;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Map;
-import java.util.WeakHashMap;
 
 import app.morphe.extension.crimera.PikoUtils;
+import app.morphe.extension.crimera.sharedPreference.SharedPref;
 import app.morphe.extension.instagram.constants.Constants;
 import app.morphe.extension.instagram.constants.UI;
 import app.morphe.extension.instagram.entity.MediaData;
 import app.morphe.extension.instagram.patches.download.DownloadUtils;
+import app.morphe.extension.instagram.settings.Settings;
 import app.morphe.extension.shared.Logger;
 import app.morphe.extension.shared.ui.Dim;
 
 @SuppressWarnings("unused")
 public final class InstantsDownloadHook {
-    private static final long INSTANT_ACTIVE_MS = 30_000L;
+    private static final long INSTANT_ACTIVE_MS = 45_000L;
 
     private static volatile String currentId;
     private static volatile String currentUsername;
@@ -33,7 +38,9 @@ public final class InstantsDownloadHook {
     private static volatile long lastInstantSeenAt;
 
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
-    private static final Map<View, ImageView> buttons = new WeakHashMap<>();
+    private static volatile PopupWindow instantPopup;
+    private static volatile ViewTreeObserver.OnPreDrawListener secureListener;
+    private static volatile View secureListenerRoot;
 
     public static void noteInstantMedia(Object media) {
         try {
@@ -55,107 +62,155 @@ public final class InstantsDownloadHook {
             currentUsername = safeStr(() -> md.getUserData().getUsername());
             lastInstantSeenAt = System.currentTimeMillis();
 
-            // The media object is created before the viewer is fully on-screen.
-            // Retry for a short period and always bring the overlay to the front.
-            scheduleOverlayInstall(180L);
-            scheduleOverlayInstall(450L);
-            scheduleOverlayInstall(900L);
-            scheduleOverlayInstall(1500L);
+            /*
+             * The existing Piko screenshot patch targets Instagram's own screenshot detector
+             * and FLAG_SECURE controller. Turn that path on when an Instant is encountered.
+             * Our bytecode patch depends on DisableScreenshotDetectionPatch, so the runtime
+             * preference is guaranteed to have matching hooks in the patched APK.
+             */
+            try {
+                SharedPref.setBooleanPref(Settings.DISABLE_SCREENSHOT_DETECTION.key, true);
+            } catch (Throwable ignored) {
+            }
+
+            // The Instant media model is built slightly before the full-screen viewer settles.
+            // A PopupWindow is used instead of adding a child to Instagram's activity decor,
+            // because the Instants viewer draws a full-screen layer above normal activity views.
+            scheduleOverlayInstall(100L);
+            scheduleOverlayInstall(300L);
+            scheduleOverlayInstall(650L);
+            scheduleOverlayInstall(1100L);
+            scheduleOverlayInstall(1800L);
         } catch (Throwable t) {
             Logger.printException(() -> "Instant media hook failed", t);
         }
     }
 
-    /** Removes FLAG_SECURE from Window flags. */
+    /** Removes FLAG_SECURE from direct Window flag calls that survived Instagram's controller. */
     public static int stripSecureFlag(int flags) {
         return flags & ~WindowManager.LayoutParams.FLAG_SECURE;
     }
 
-    /**
-     * Instagram can protect video through SurfaceView/SurfaceControl rather than Window.FLAG_SECURE.
-     * While an Instant is active, force those secure-surface booleans off too.
-     */
+    /** Removes secure SurfaceView / SurfaceControl protection while an Instant is active. */
     public static boolean stripSecureSurface(boolean secure) {
         if (!secure) return false;
         long age = System.currentTimeMillis() - lastInstantSeenAt;
         if (currentUrl != null && age >= 0 && age <= INSTANT_ACTIVE_MS) return false;
-        return secure;
+        return true;
     }
 
     private static void scheduleOverlayInstall(long delayMs) {
         MAIN.postDelayed(() -> {
             try {
-                long age = System.currentTimeMillis() - lastInstantSeenAt;
-                if (currentUrl == null || age < 0 || age > INSTANT_ACTIVE_MS) return;
+                if (!isInstantActive()) return;
                 Activity activity = findCurrentActivity();
-                if (activity != null) installInstantControls(activity);
+                if (activity != null) {
+                    installScreenshotGuard(activity);
+                    showInstantPopup(activity);
+                }
             } catch (Throwable t) {
                 Logger.printException(() -> "Instant overlay retry failed", t);
             }
         }, delayMs);
     }
 
-    private static void installInstantControls(Activity activity) {
+    private static boolean isInstantActive() {
+        long age = System.currentTimeMillis() - lastInstantSeenAt;
+        return currentUrl != null && age >= 0 && age <= INSTANT_ACTIVE_MS;
+    }
+
+    private static void installScreenshotGuard(Activity activity) {
         try {
             activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
+            final View decor = activity.getWindow().getDecorView();
 
-            View decor = activity.getWindow().getDecorView();
-            if (!(decor instanceof FrameLayout)) return;
-            FrameLayout root = (FrameLayout) decor;
+            // Instagram may restore the flag after the first frame. Keep clearing it only
+            // during the short Instant-viewing window.
+            if (secureListenerRoot == decor && secureListener != null) return;
+            removeSecureListener();
 
-            ImageView button;
-            synchronized (buttons) {
-                button = buttons.get(root);
-                if (button == null) {
-                    button = createDownloadButton(root);
-                    if (button == null) return;
-                    buttons.put(root, button);
-                }
-                button.setVisibility(View.VISIBLE);
-            }
-
-            button.setElevation(100_000f);
-            button.bringToFront();
-            root.invalidate();
-
-            final ImageView finalButton = button;
-            MAIN.postDelayed(() -> {
+            final ViewTreeObserver.OnPreDrawListener[] holder = new ViewTreeObserver.OnPreDrawListener[1];
+            holder[0] = () -> {
                 try {
-                    if (System.currentTimeMillis() - lastInstantSeenAt > INSTANT_ACTIVE_MS) {
-                        finalButton.setVisibility(View.GONE);
+                    if (isInstantActive()) {
+                        activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
+                    } else {
+                        ViewTreeObserver observer = decor.getViewTreeObserver();
+                        if (observer.isAlive()) observer.removeOnPreDrawListener(holder[0]);
+                        secureListener = null;
+                        secureListenerRoot = null;
                     }
                 } catch (Throwable ignored) {
                 }
-            }, INSTANT_ACTIVE_MS + 500L);
+                return true;
+            };
+
+            secureListener = holder[0];
+            secureListenerRoot = decor;
+            decor.getViewTreeObserver().addOnPreDrawListener(holder[0]);
         } catch (Throwable t) {
-            Logger.printException(() -> "Instant controls setup failed", t);
+            Logger.printException(() -> "Instant screenshot guard failed", t);
         }
     }
 
-    private static ImageView createDownloadButton(FrameLayout root) {
+    private static void removeSecureListener() {
         try {
-            Context context = root.getContext();
+            View root = secureListenerRoot;
+            ViewTreeObserver.OnPreDrawListener listener = secureListener;
+            if (root != null && listener != null) {
+                ViewTreeObserver observer = root.getViewTreeObserver();
+                if (observer.isAlive()) observer.removeOnPreDrawListener(listener);
+            }
+        } catch (Throwable ignored) {
+        }
+        secureListener = null;
+        secureListenerRoot = null;
+    }
+
+    private static void showInstantPopup(Activity activity) {
+        try {
+            PopupWindow old = instantPopup;
+            if (old != null && old.isShowing()) {
+                // Already on top. Keep its click target/media current instead of stacking windows.
+                return;
+            }
+
+            Context context = activity;
             ImageView button = new ImageView(context);
             UI.setThemedIcon(button, UI.DRAWABLE_DOWNLOAD_ICON);
             button.setContentDescription("Download Instant");
             button.setPadding(Dim.dp12, Dim.dp12, Dim.dp12, Dim.dp12);
             button.setOnClickListener(v -> downloadCurrentInstant(v.getContext()));
 
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+            PopupWindow popup = new PopupWindow(
+                    button,
                     Dim.dp16 * 3,
-                    Dim.dp16 * 3
+                    Dim.dp16 * 3,
+                    false
             );
-            lp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
-            lp.topMargin = getStatusBarHeight(context) + (Dim.dp16 / 4);
-            lp.rightMargin = Dim.dp16 * 7;
+            popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            popup.setOutsideTouchable(false);
+            popup.setTouchable(true);
+            popup.setClippingEnabled(false);
+            popup.setElevation(100_000f);
 
-            root.addView(button, lp);
-            button.setElevation(100_000f);
-            button.bringToFront();
-            return button;
+            View anchor = activity.getWindow().getDecorView();
+            int top = getStatusBarHeight(context) + (Dim.dp16 / 4);
+            int right = Dim.dp16 * 7;
+            popup.showAtLocation(anchor, Gravity.TOP | Gravity.END, right, top);
+            instantPopup = popup;
+
+            MAIN.postDelayed(() -> {
+                try {
+                    if (!isInstantActive() && instantPopup == popup) {
+                        popup.dismiss();
+                        instantPopup = null;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }, INSTANT_ACTIVE_MS + 750L);
         } catch (Throwable t) {
-            Logger.printException(() -> "Failed to add Instant download button", t);
-            return null;
+            Logger.printException(() -> "Failed to show Instant download popup", t);
         }
     }
 
