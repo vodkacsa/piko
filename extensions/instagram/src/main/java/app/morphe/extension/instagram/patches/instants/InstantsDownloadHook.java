@@ -1,14 +1,16 @@
 package app.morphe.extension.instagram.patches.instants;
 
+import android.app.Activity;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.View;
-import android.view.Window;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.WeakHashMap;
 
@@ -22,8 +24,7 @@ import app.morphe.extension.shared.ui.Dim;
 
 @SuppressWarnings("unused")
 public final class InstantsDownloadHook {
-    private static final long INSTANT_MATCH_WINDOW_MS = 60_000L;
-    private static final long BUTTON_FALLBACK_HIDE_MS = 120_000L;
+    private static final long INSTANT_ACTIVE_MS = 30_000L;
 
     private static volatile String currentId;
     private static volatile String currentUsername;
@@ -33,8 +34,6 @@ public final class InstantsDownloadHook {
 
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Map<View, ImageView> buttons = new WeakHashMap<>();
-    private static final ThreadLocal<Boolean> secureFlagAttempt = new ThreadLocal<>();
-    private static final ThreadLocal<Boolean> secureFlagClear = new ThreadLocal<>();
 
     public static void noteInstantMedia(Object media) {
         try {
@@ -55,61 +54,55 @@ public final class InstantsDownloadHook {
             currentUrl = url;
             currentUsername = safeStr(() -> md.getUserData().getUsername());
             lastInstantSeenAt = System.currentTimeMillis();
+
+            // The media object is created before the viewer is fully on-screen.
+            // Retry for a short period and always bring the overlay to the front.
+            scheduleOverlayInstall(180L);
+            scheduleOverlayInstall(450L);
+            scheduleOverlayInstall(900L);
+            scheduleOverlayInstall(1500L);
         } catch (Throwable t) {
             Logger.printException(() -> "Instant media hook failed", t);
         }
     }
 
-    /**
-     * Called immediately before Instagram calls Window.addFlags/setFlags.
-     * FLAG_SECURE is removed before Android receives it, matching the strategy
-     * used by InstaEclipse's screenshot-permission hook.
-     */
+    /** Removes FLAG_SECURE from Window flags. */
     public static int stripSecureFlag(int flags) {
-        boolean hadSecure = (flags & WindowManager.LayoutParams.FLAG_SECURE) != 0;
-        secureFlagAttempt.set(hadSecure);
         return flags & ~WindowManager.LayoutParams.FLAG_SECURE;
     }
 
-    /** Called with the exact Window on which Instagram attempted to set flags. */
-    public static void noteWindowFlagCall(Window window) {
-        try {
-            boolean attemptedSecure = Boolean.TRUE.equals(secureFlagAttempt.get());
-            secureFlagAttempt.remove();
-            if (!attemptedSecure || window == null) return;
-
-            long mediaAge = System.currentTimeMillis() - lastInstantSeenAt;
-            if (currentUrl == null || mediaAge < 0 || mediaAge > INSTANT_MATCH_WINDOW_MS) return;
-
-            // The secure flag is normally applied as the Instants viewer window opens.
-            // Wait one frame so its own content is attached, then place our control on
-            // that exact window rather than on Instagram's always-present activity.
-            MAIN.postDelayed(() -> installInstantControls(window), 80L);
-        } catch (Throwable t) {
-            Logger.printException(() -> "Instant secure-window hook failed", t);
-        }
+    /**
+     * Instagram can protect video through SurfaceView/SurfaceControl rather than Window.FLAG_SECURE.
+     * While an Instant is active, force those secure-surface booleans off too.
+     */
+    public static boolean stripSecureSurface(boolean secure) {
+        if (!secure) return false;
+        long age = System.currentTimeMillis() - lastInstantSeenAt;
+        if (currentUrl != null && age >= 0 && age <= INSTANT_ACTIVE_MS) return false;
+        return secure;
     }
 
-    public static void noteClearFlag(int flags) {
-        secureFlagClear.set((flags & WindowManager.LayoutParams.FLAG_SECURE) != 0);
+    private static void scheduleOverlayInstall(long delayMs) {
+        MAIN.postDelayed(() -> {
+            try {
+                long age = System.currentTimeMillis() - lastInstantSeenAt;
+                if (currentUrl == null || age < 0 || age > INSTANT_ACTIVE_MS) return;
+                Activity activity = findCurrentActivity();
+                if (activity != null) installInstantControls(activity);
+            } catch (Throwable t) {
+                Logger.printException(() -> "Instant overlay retry failed", t);
+            }
+        }, delayMs);
     }
 
-    public static void noteWindowClearCall(Window window) {
+    private static void installInstantControls(Activity activity) {
         try {
-            boolean clearingSecure = Boolean.TRUE.equals(secureFlagClear.get());
-            secureFlagClear.remove();
-            if (clearingSecure && window != null) hideInstantControls(window);
-        } catch (Throwable t) {
-            Logger.printException(() -> "Instant clear-window hook failed", t);
-        }
-    }
+            activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
 
-    private static void installInstantControls(Window window) {
-        try {
-            View decor = window.getDecorView();
+            View decor = activity.getWindow().getDecorView();
             if (!(decor instanceof FrameLayout)) return;
-
             FrameLayout root = (FrameLayout) decor;
+
             ImageView button;
             synchronized (buttons) {
                 button = buttons.get(root);
@@ -121,36 +114,22 @@ public final class InstantsDownloadHook {
                 button.setVisibility(View.VISIBLE);
             }
 
-            // The Instants viewer can add its own full-screen child after the media
-            // object is created. High Z + bringToFront keeps the button above it.
-            button.setElevation(10_000f);
+            button.setElevation(100_000f);
             button.bringToFront();
+            root.invalidate();
 
             final ImageView finalButton = button;
             MAIN.postDelayed(() -> {
                 try {
-                    if (System.currentTimeMillis() - lastInstantSeenAt >= BUTTON_FALLBACK_HIDE_MS) {
+                    if (System.currentTimeMillis() - lastInstantSeenAt > INSTANT_ACTIVE_MS) {
                         finalButton.setVisibility(View.GONE);
                     }
                 } catch (Throwable ignored) {
                 }
-            }, BUTTON_FALLBACK_HIDE_MS);
+            }, INSTANT_ACTIVE_MS + 500L);
         } catch (Throwable t) {
             Logger.printException(() -> "Instant controls setup failed", t);
         }
-    }
-
-    private static void hideInstantControls(Window window) {
-        MAIN.post(() -> {
-            try {
-                View decor = window.getDecorView();
-                synchronized (buttons) {
-                    ImageView button = buttons.get(decor);
-                    if (button != null) button.setVisibility(View.GONE);
-                }
-            } catch (Throwable ignored) {
-            }
-        });
     }
 
     private static ImageView createDownloadButton(FrameLayout root) {
@@ -171,7 +150,7 @@ public final class InstantsDownloadHook {
             lp.rightMargin = Dim.dp16 * 7;
 
             root.addView(button, lp);
-            button.setElevation(10_000f);
+            button.setElevation(100_000f);
             button.bringToFront();
             return button;
         } catch (Throwable t) {
@@ -208,6 +187,37 @@ public final class InstantsDownloadHook {
         } catch (Throwable ignored) {
             return 0;
         }
+    }
+
+    private static Activity findCurrentActivity() {
+        try {
+            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+            Method currentActivityThread = activityThreadClass.getDeclaredMethod("currentActivityThread");
+            currentActivityThread.setAccessible(true);
+            Object activityThread = currentActivityThread.invoke(null);
+            if (activityThread == null) return null;
+
+            Field activitiesField = activityThreadClass.getDeclaredField("mActivities");
+            activitiesField.setAccessible(true);
+            Object activitiesObject = activitiesField.get(activityThread);
+            if (!(activitiesObject instanceof Map)) return null;
+
+            for (Object record : ((Map<?, ?>) activitiesObject).values()) {
+                try {
+                    Field pausedField = record.getClass().getDeclaredField("paused");
+                    pausedField.setAccessible(true);
+                    if (pausedField.getBoolean(record)) continue;
+
+                    Field activityField = record.getClass().getDeclaredField("activity");
+                    activityField.setAccessible(true);
+                    Object activity = activityField.get(record);
+                    if (activity instanceof Activity) return (Activity) activity;
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     private interface StrCall { String get() throws Exception; }
