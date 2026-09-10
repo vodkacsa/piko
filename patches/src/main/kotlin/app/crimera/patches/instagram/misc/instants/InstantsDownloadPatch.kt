@@ -18,10 +18,10 @@ import com.android.tools.smali.dexlib2.iface.reference.TypeReference
 
 private const val HOOK = "Lapp/morphe/extension/instagram/patches/instants/InstantsDownloadHook;"
 private const val WINDOW_CLASS = "Landroid/view/Window;"
+private const val SURFACE_VIEW_CLASS = "Landroid/view/SurfaceView;"
+private const val SURFACE_TRANSACTION_CLASS = "Landroid/view/SurfaceControl\$Transaction;"
 private const val STRIP_SECURE = "$HOOK->stripSecureFlag(I)I"
-private const val NOTE_WINDOW_FLAGS = "$HOOK->noteWindowFlagCall(Landroid/view/Window;)V"
-private const val NOTE_CLEAR_FLAG = "$HOOK->noteClearFlag(I)V"
-private const val NOTE_WINDOW_CLEAR = "$HOOK->noteWindowClearCall(Landroid/view/Window;)V"
+private const val STRIP_SECURE_SURFACE = "$HOOK->stripSecureSurface(Z)Z"
 
 @Suppress("unused")
 val instantsDownloadPatch = bytecodePatch(
@@ -37,8 +37,9 @@ val instantsDownloadPatch = bytecodePatch(
                 0, "invoke-static {p1}, $HOOK->noteInstantMedia(Ljava/lang/Object;)V"
             )
 
-            val secureCalls = patchWindowSecureFlagCalls()
-            println("[piko] Instants: patched $secureCalls Window secure-flag calls")
+            val windowCalls = patchWindowSecureFlagCalls()
+            val surfaceCalls = patchSecureSurfaceCalls()
+            println("[piko] Instants: patched $windowCalls Window calls and $surfaceCalls secure-surface calls")
         }.onFailure { println("[piko] Download Instants disabled: ${it.message}") }
     }
 }
@@ -64,47 +65,76 @@ private fun patchWindowSecureFlagCalls(): Int {
 
                 val params = reference.parameterTypes.map(CharSequence::toString)
                 when {
-                    reference.name == "addFlags" && params == listOf("I") -> Triple(index, reference.name, 2)
-                    reference.name == "setFlags" && params == listOf("I", "I") -> Triple(index, reference.name, 3)
-                    reference.name == "clearFlags" && params == listOf("I") -> Triple(index, reference.name, 2)
+                    reference.name == "addFlags" && params == listOf("I") -> index
+                    reference.name == "setFlags" && params == listOf("I", "I") -> index
                     else -> null
                 }
             }
 
-            targets.sortedByDescending { it.first }.forEach { (index, name, expectedRegisters) ->
+            targets.sortedDescending().forEach { index ->
                 val registers = method.instructions[index].registersUsed
-                if (registers.size != expectedRegisters) return@forEach
-
-                val windowRegister = registers[0]
+                if (registers.size < 2) return@forEach
                 val flagsRegister = registers[1]
-
-                when (name) {
-                    "addFlags", "setFlags" -> {
-                        method.addInstructions(
-                            index,
-                            """
-                            invoke-static/range {v$flagsRegister .. v$flagsRegister}, $STRIP_SECURE
-                            move-result v$flagsRegister
-                            invoke-static/range {v$windowRegister .. v$windowRegister}, $NOTE_WINDOW_FLAGS
-                            """.trimIndent(),
-                        )
-                    }
-
-                    "clearFlags" -> {
-                        method.addInstructions(
-                            index,
-                            """
-                            invoke-static/range {v$flagsRegister .. v$flagsRegister}, $NOTE_CLEAR_FLAG
-                            invoke-static/range {v$windowRegister .. v$windowRegister}, $NOTE_WINDOW_CLEAR
-                            """.trimIndent(),
-                        )
-                    }
-                }
+                method.addInstructions(
+                    index,
+                    """
+                    invoke-static/range {v$flagsRegister .. v$flagsRegister}, $STRIP_SECURE
+                    move-result v$flagsRegister
+                    """.trimIndent(),
+                )
                 patched++
             }
         }
     }
+    return patched
+}
 
+context(patchContext: BytecodePatchContext)
+private fun patchSecureSurfaceCalls(): Int {
+    val classes = mutableListOf<ClassDef>()
+    patchContext.classDefForEach { classes += it }
+
+    var patched = 0
+    classes.forEach { classDef ->
+        val mutableClass = patchContext.mutableClassDefBy(classDef)
+        mutableClass.methods.forEach { method ->
+            val targets = method.instructions.mapIndexedNotNull { index, instruction ->
+                if (
+                    instruction.opcode != Opcode.INVOKE_VIRTUAL &&
+                    instruction.opcode != Opcode.INVOKE_VIRTUAL_RANGE
+                ) return@mapIndexedNotNull null
+
+                val reference = instruction.getReference<MethodReference>()
+                    ?: return@mapIndexedNotNull null
+                val params = reference.parameterTypes.map(CharSequence::toString)
+
+                when {
+                    reference.definingClass == SURFACE_VIEW_CLASS &&
+                        reference.name == "setSecure" && params == listOf("Z") -> Pair(index, 1)
+
+                    reference.definingClass == SURFACE_TRANSACTION_CLASS &&
+                        reference.name == "setSecure" &&
+                        params == listOf("Landroid/view/SurfaceControl;", "Z") -> Pair(index, 2)
+
+                    else -> null
+                }
+            }
+
+            targets.sortedByDescending { it.first }.forEach { (index, boolPosition) ->
+                val registers = method.instructions[index].registersUsed
+                if (registers.size <= boolPosition) return@forEach
+                val secureRegister = registers[boolPosition]
+                method.addInstructions(
+                    index,
+                    """
+                    invoke-static/range {v$secureRegister .. v$secureRegister}, $STRIP_SECURE_SURFACE
+                    move-result v$secureRegister
+                    """.trimIndent(),
+                )
+                patched++
+            }
+        }
+    }
     return patched
 }
 
