@@ -39,4 +39,4 @@ jobs:
           fail_on_unmatched_files: true
 
 # Test release workflow for the Instant patch.
-# Build trigger for the Instant viewer window fix.
+# Build trigger for the popup + Piko screenshot-controller fix.
