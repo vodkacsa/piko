@@ -62,20 +62,11 @@ public final class InstantsDownloadHook {
             currentUsername = safeStr(() -> md.getUserData().getUsername());
             lastInstantSeenAt = System.currentTimeMillis();
 
-            /*
-             * The existing Piko screenshot patch targets Instagram's own screenshot detector
-             * and FLAG_SECURE controller. Turn that path on when an Instant is encountered.
-             * Our bytecode patch depends on DisableScreenshotDetectionPatch, so the runtime
-             * preference is guaranteed to have matching hooks in the patched APK.
-             */
             try {
                 SharedPref.setBooleanPref(Settings.DISABLE_SCREENSHOT_DETECTION.key, true);
             } catch (Throwable ignored) {
             }
 
-            // The Instant media model is built slightly before the full-screen viewer settles.
-            // A PopupWindow is used instead of adding a child to Instagram's activity decor,
-            // because the Instants viewer draws a full-screen layer above normal activity views.
             scheduleOverlayInstall(100L);
             scheduleOverlayInstall(300L);
             scheduleOverlayInstall(650L);
@@ -86,17 +77,14 @@ public final class InstantsDownloadHook {
         }
     }
 
-    /** Removes FLAG_SECURE from direct Window flag calls that survived Instagram's controller. */
+    /** Globally removes FLAG_SECURE from direct Window flag calls inside Instagram. */
     public static int stripSecureFlag(int flags) {
         return flags & ~WindowManager.LayoutParams.FLAG_SECURE;
     }
 
-    /** Removes secure SurfaceView / SurfaceControl protection while an Instant is active. */
+    /** Diagnostic build: never allow Instagram to mark a SurfaceView/SurfaceControl secure. */
     public static boolean stripSecureSurface(boolean secure) {
-        if (!secure) return false;
-        long age = System.currentTimeMillis() - lastInstantSeenAt;
-        if (currentUrl != null && age >= 0 && age <= INSTANT_ACTIVE_MS) return false;
-        return true;
+        return false;
     }
 
     private static void scheduleOverlayInstall(long delayMs) {
@@ -124,8 +112,6 @@ public final class InstantsDownloadHook {
             activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
             final View decor = activity.getWindow().getDecorView();
 
-            // Instagram may restore the flag after the first frame. Keep clearing it only
-            // during the short Instant-viewing window.
             if (secureListenerRoot == decor && secureListener != null) return;
             removeSecureListener();
 
@@ -171,7 +157,6 @@ public final class InstantsDownloadHook {
         try {
             PopupWindow old = instantPopup;
             if (old != null && old.isShowing()) {
-                // Already on top. Keep its click target/media current instead of stacking windows.
                 return;
             }
 
