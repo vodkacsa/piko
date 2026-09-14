@@ -1,6 +1,7 @@
 package app.crimera.patches.instagram.misc.instants
 
 import app.crimera.patches.instagram.entity.decoder.decoderEntity
+import app.crimera.patches.instagram.misc.privacy.AddFlagsToWindowFingerprint
 import app.crimera.patches.instagram.misc.privacy.disableScreenshotDetection
 import app.crimera.patches.instagram.utils.Constants.COMPATIBILITY_INSTAGRAM
 import app.morphe.patcher.extensions.InstructionExtensions.addInstruction
@@ -19,6 +20,7 @@ import com.android.tools.smali.dexlib2.iface.reference.TypeReference
 
 private const val HOOK = "Lapp/morphe/extension/instagram/patches/instants/InstantsDownloadHook;"
 private const val WINDOW_CLASS = "Landroid/view/Window;"
+private const val LAYOUT_PARAMS_CLASS = "Landroid/view/WindowManager\$LayoutParams;"
 private const val SURFACE_VIEW_CLASS = "Landroid/view/SurfaceView;"
 private const val SURFACE_TRANSACTION_CLASS = "Landroid/view/SurfaceControl\$Transaction;"
 private const val STRIP_SECURE = "$HOOK->stripSecureFlag(I)I"
@@ -29,8 +31,6 @@ val instantsDownloadPatch = bytecodePatch(
     name = "Download Instants",
     description = "Adds a download button to the Instants viewer and allows screenshots/screen recording there.",
 ) {
-    // Piko's own screenshot patch fingerprints Instagram's internal FLAG_SECURE controller.
-    // Depending on it is much more reliable than relying only on framework call-site matching.
     dependsOn(decoderEntity, disableScreenshotDetection)
     compatibleWith(COMPATIBILITY_INSTAGRAM)
     execute {
@@ -40,11 +40,22 @@ val instantsDownloadPatch = bytecodePatch(
                 0, "invoke-static {p1}, $HOOK->noteInstantMedia(Ljava/lang/Object;)V"
             )
 
-            // Keep these as a second line of defence for builds that protect an Instant
-            // with a direct Window or secure Surface call.
+            /*
+             * Diagnostic build: disable secure-window protection globally inside Instagram.
+             * Piko already fingerprints Instagram's internal FLAG_SECURE controller. Returning
+             * immediately from that controller is more reliable than trying to guess which
+             * Activity/Window belongs to the Instants viewer.
+             */
+            AddFlagsToWindowFingerprint.method.addInstruction(0, "return-void")
+
+            // Also catch direct Android API paths and LayoutParams.flags writes.
             val windowCalls = patchWindowSecureFlagCalls()
+            val layoutParamWrites = patchLayoutParamsFlagWrites()
             val surfaceCalls = patchSecureSurfaceCalls()
-            println("[piko] Instants: patched $windowCalls Window calls and $surfaceCalls secure-surface calls")
+            println(
+                "[piko] Instants global secure bypass: $windowCalls Window calls, " +
+                    "$layoutParamWrites LayoutParams writes, $surfaceCalls secure-surface calls"
+            )
         }.onFailure { println("[piko] Download Instants disabled: ${it.message}") }
     }
 }
@@ -80,6 +91,45 @@ private fun patchWindowSecureFlagCalls(): Int {
                 val registers = method.instructions[index].registersUsed
                 if (registers.size < 2) return@forEach
                 val flagsRegister = registers[1]
+                method.addInstructions(
+                    index,
+                    """
+                    invoke-static/range {v$flagsRegister .. v$flagsRegister}, $STRIP_SECURE
+                    move-result v$flagsRegister
+                    """.trimIndent(),
+                )
+                patched++
+            }
+        }
+    }
+    return patched
+}
+
+context(patchContext: BytecodePatchContext)
+private fun patchLayoutParamsFlagWrites(): Int {
+    val classes = mutableListOf<ClassDef>()
+    patchContext.classDefForEach { classes += it }
+
+    var patched = 0
+    classes.forEach { classDef ->
+        val mutableClass = patchContext.mutableClassDefBy(classDef)
+        mutableClass.methods.forEach { method ->
+            val targets = method.instructions.mapIndexedNotNull { index, instruction ->
+                if (instruction.opcode != Opcode.IPUT) return@mapIndexedNotNull null
+
+                val reference = instruction.getReference<FieldReference>()
+                    ?: return@mapIndexedNotNull null
+                if (
+                    reference.definingClass == LAYOUT_PARAMS_CLASS &&
+                    reference.name == "flags" &&
+                    reference.type == "I"
+                ) index else null
+            }
+
+            targets.sortedDescending().forEach { index ->
+                val registers = method.instructions[index].registersUsed
+                if (registers.isEmpty()) return@forEach
+                val flagsRegister = registers[0]
                 method.addInstructions(
                     index,
                     """
