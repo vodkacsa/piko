@@ -1,5 +1,6 @@
 package app.morphe.extension.instagram.patches.instants;
 
+import android.app.Activity;
 import android.app.Dialog;
 import android.content.Context;
 import android.graphics.Color;
@@ -14,6 +15,8 @@ import android.widget.PopupWindow;
 import android.widget.TextView;
 
 import java.lang.ref.WeakReference;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -21,7 +24,7 @@ import java.util.WeakHashMap;
 
 @SuppressWarnings("unused")
 public final class InstantsDownloadHook {
-    private static final long ACTIVE_MS = 60_000L;
+    private static final long ACTIVE_MS = 30_000L;
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
     private static final Map<View, Integer> IDS = new WeakHashMap<>();
@@ -36,66 +39,75 @@ public final class InstantsDownloadHook {
         if (media == null) return;
         lastInstantSeenAt = System.currentTimeMillis();
 
-        scheduleRefresh(0L);
-        scheduleRefresh(80L);
-        scheduleRefresh(200L);
-        scheduleRefresh(450L);
-        scheduleRefresh(900L);
-        scheduleRefresh(1500L);
-        scheduleRefresh(2500L);
-        scheduleRefresh(4000L);
-        scheduleRefresh(7000L);
+        // Scan repeatedly because the Instant viewer is created after the media model.
+        long[] delays = {0L, 50L, 120L, 250L, 500L, 900L, 1500L, 2500L, 4000L, 6500L};
+        for (long delay : delays) {
+            MAIN.postDelayed(InstantsDownloadHook::scanActivitiesAndKnownRoots, delay);
+        }
 
         MAIN.postDelayed(() -> {
             if (!isInstantActive()) clearLabels();
         }, ACTIVE_MS + 1000L);
     }
 
-    /** Called before Instagram invokes a method on an actual android.view.Window. */
-    public static void noteWindow(Window window) {
-        if (window == null) return;
+    /**
+     * Receives arbitrary app-side receivers from window-ish calls. Using Object here is
+     * intentional so subclasses/wrappers do not have to resolve to android.view.Window in dex.
+     */
+    public static void noteObject(Object object) {
+        if (object == null) return;
         try {
-            View decor = window.getDecorView();
-            rememberRoot(decor, "Window", window);
+            if (object instanceof Window) {
+                noteWindow((Window) object);
+            } else if (object instanceof Activity) {
+                Activity activity = (Activity) object;
+                noteWindow(activity.getWindow());
+            } else if (object instanceof Dialog) {
+                noteDialog((Dialog) object);
+            } else if (object instanceof PopupWindow) {
+                notePopup((PopupWindow) object);
+            } else if (object instanceof View) {
+                noteWindowRoot((View) object);
+            }
         } catch (Throwable ignored) {
         }
     }
 
-    /** Called around Dialog.show() so dialog-owned windows get their own stable W# label. */
+    public static void noteWindow(Window window) {
+        if (window == null) return;
+        try {
+            rememberRoot(window.getDecorView(), "Window", window);
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static void noteDialog(Dialog dialog) {
         if (dialog == null) return;
         tryDialog(dialog);
-        MAIN.postDelayed(() -> tryDialog(dialog), 50L);
-        MAIN.postDelayed(() -> tryDialog(dialog), 200L);
+        MAIN.postDelayed(() -> tryDialog(dialog), 60L);
+        MAIN.postDelayed(() -> tryDialog(dialog), 220L);
     }
 
-    /** Called around PopupWindow show calls. */
     public static void notePopup(PopupWindow popup) {
         if (popup == null) return;
         tryPopup(popup);
-        MAIN.postDelayed(() -> tryPopup(popup), 50L);
-        MAIN.postDelayed(() -> tryPopup(popup), 200L);
+        MAIN.postDelayed(() -> tryPopup(popup), 60L);
+        MAIN.postDelayed(() -> tryPopup(popup), 220L);
     }
 
-    /** Called when Instagram hands a root View to WindowManager/ViewManager. */
     public static void noteWindowRoot(View root) {
         if (root == null) return;
-        rememberRoot(root, "WindowManager", null);
-        MAIN.postDelayed(() -> {
-            try {
-                View actualRoot = root.getRootView();
-                if (actualRoot != null) rememberRoot(actualRoot, "WindowManager", null);
-            } catch (Throwable ignored) {
-            }
-        }, 50L);
+        try {
+            View actual = root.getRootView();
+            rememberRoot(actual != null ? actual : root, "ViewRoot", null);
+        } catch (Throwable ignored) {
+        }
     }
 
     private static void tryDialog(Dialog dialog) {
         try {
             Window window = dialog.getWindow();
-            if (window == null) return;
-            View decor = window.getDecorView();
-            rememberRoot(decor, "Dialog", window);
+            if (window != null) rememberRoot(window.getDecorView(), "Dialog", window);
         } catch (Throwable ignored) {
         }
     }
@@ -110,27 +122,112 @@ public final class InstantsDownloadHook {
         }
     }
 
+    private static void scanActivitiesAndKnownRoots() {
+        if (!isInstantActive()) return;
+        scanActivities();
+        refreshKnownRoots();
+    }
+
+    /**
+     * ActivityThread reflection is used only as a diagnostic fallback. This worked in the
+     * earlier download-button build on the same app, and does not modify any window flags.
+     */
+    private static void scanActivities() {
+        try {
+            Class<?> atClass = Class.forName("android.app.ActivityThread");
+            Method current = atClass.getDeclaredMethod("currentActivityThread");
+            current.setAccessible(true);
+            Object thread = current.invoke(null);
+            if (thread == null) return;
+
+            Field activitiesField = atClass.getDeclaredField("mActivities");
+            activitiesField.setAccessible(true);
+            Object records = activitiesField.get(thread);
+            if (!(records instanceof Map)) return;
+
+            for (Object record : ((Map<?, ?>) records).values()) {
+                if (record == null) continue;
+                try {
+                    Field activityField = record.getClass().getDeclaredField("activity");
+                    activityField.setAccessible(true);
+                    Object value = activityField.get(record);
+                    if (!(value instanceof Activity)) continue;
+
+                    Activity activity = (Activity) value;
+                    Window window = activity.getWindow();
+                    if (window == null) continue;
+                    View decor = window.getDecorView();
+                    if (decor == null) continue;
+
+                    rememberRoot(decor, "Activity:" + activity.getClass().getSimpleName(), window);
+                    decor.post(() -> scanLargeViewGroups(decor));
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * If Instants is not a second Android Window but a full-screen child container, this finds
+     * and labels those large visible ViewGroups too. Only a small number are labelled.
+     */
+    private static void scanLargeViewGroups(View decor) {
+        if (!(decor instanceof ViewGroup) || !isInstantActive()) return;
+        int screenW = decor.getWidth();
+        int screenH = decor.getHeight();
+        if (screenW <= 0 || screenH <= 0) return;
+
+        int[] budget = {12};
+        scanLargeViewGroupsRecursive((ViewGroup) decor, screenW, screenH, 0, budget);
+    }
+
+    private static void scanLargeViewGroupsRecursive(
+            ViewGroup group,
+            int screenW,
+            int screenH,
+            int depth,
+            int[] budget
+    ) {
+        if (budget[0] <= 0 || depth > 8 || !group.isShown()) return;
+
+        if (depth > 0 &&
+                group.getWidth() >= (screenW * 3 / 4) &&
+                group.getHeight() >= (screenH * 3 / 4)) {
+            rememberRoot(group, "FullScreenView d=" + depth, null);
+            budget[0]--;
+        }
+
+        for (int i = group.getChildCount() - 1; i >= 0 && budget[0] > 0; i--) {
+            View child = group.getChildAt(i);
+            if (child instanceof ViewGroup) {
+                scanLargeViewGroupsRecursive((ViewGroup) child, screenW, screenH, depth + 1, budget);
+            }
+        }
+    }
+
     private static void rememberRoot(View candidate, String source, Window window) {
         if (candidate == null) return;
         final View root;
         try {
-            View resolved = candidate.getRootView();
-            root = resolved != null ? resolved : candidate;
+            // Preserve explicitly discovered full-screen children, otherwise resolve to top root.
+            if (source != null && source.startsWith("FullScreenView")) {
+                root = candidate;
+            } else {
+                View resolved = candidate.getRootView();
+                root = resolved != null ? resolved : candidate;
+            }
         } catch (Throwable ignored) {
             return;
         }
 
         synchronized (IDS) {
             if (!IDS.containsKey(root)) IDS.put(root, nextId++);
-            if (!SOURCES.containsKey(root) || "WindowManager".equals(SOURCES.get(root))) {
-                SOURCES.put(root, source);
-            }
+            SOURCES.put(root, source);
             if (window != null) WINDOWS.put(root, new WeakReference<>(window));
         }
 
-        if (isInstantActive()) {
-            root.post(() -> installOrUpdateLabel(root));
-        }
+        if (isInstantActive()) root.post(() -> installOrUpdateLabel(root));
     }
 
     private static boolean isInstantActive() {
@@ -138,13 +235,7 @@ public final class InstantsDownloadHook {
         return age >= 0 && age <= ACTIVE_MS;
     }
 
-    private static void scheduleRefresh(long delayMs) {
-        MAIN.postDelayed(InstantsDownloadHook::refreshKnownRoots, delayMs);
-    }
-
     private static void refreshKnownRoots() {
-        if (!isInstantActive()) return;
-
         final List<View> roots;
         synchronized (IDS) {
             roots = new ArrayList<>(IDS.keySet());
@@ -160,7 +251,7 @@ public final class InstantsDownloadHook {
     }
 
     private static void installOrUpdateLabel(View root) {
-        if (!(root instanceof ViewGroup) || !isInstantActive()) return;
+        if (!(root instanceof ViewGroup) || !isInstantActive() || !root.isShown()) return;
 
         try {
             ViewGroup group = (ViewGroup) root;
@@ -177,7 +268,6 @@ public final class InstantsDownloadHook {
                 }
                 id = found;
                 source = SOURCES.get(root);
-
                 WeakReference<Window> ref = WINDOWS.get(root);
                 window = ref != null ? ref.get() : null;
 
@@ -191,17 +281,20 @@ public final class InstantsDownloadHook {
 
             label.setText(describe(root, window, id, source));
 
-            int maxWidth = Math.max(dp(root.getContext(), 220), root.getWidth() - dp(root.getContext(), 24));
+            int maxWidth = Math.max(dp(root.getContext(), 240), root.getWidth() - dp(root.getContext(), 16));
             label.measure(
                     View.MeasureSpec.makeMeasureSpec(maxWidth, View.MeasureSpec.AT_MOST),
                     View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
             );
 
-            int left = dp(root.getContext(), 12);
-            int top = dp(root.getContext(), 48);
+            // Spread overlapping full-screen candidates vertically so several IDs stay visible.
+            int left = dp(root.getContext(), 8);
+            int slot = (id - 1) % 8;
+            int top = dp(root.getContext(), 38 + slot * 42);
             int width = label.getMeasuredWidth();
             int height = label.getMeasuredHeight();
             label.layout(left, top, left + width, top + height);
+            label.setElevation(100000f);
             label.bringToFront();
         } catch (Throwable ignored) {
         }
@@ -210,17 +303,16 @@ public final class InstantsDownloadHook {
     private static TextView createLabel(Context context) {
         TextView label = new TextView(context);
         label.setTextColor(Color.WHITE);
-        label.setTextSize(14f);
-        label.setPadding(dp(context, 10), dp(context, 7), dp(context, 10), dp(context, 7));
+        label.setTextSize(13f);
+        label.setPadding(dp(context, 9), dp(context, 6), dp(context, 9), dp(context, 6));
         label.setClickable(false);
         label.setFocusable(false);
         label.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
-        label.setElevation(dp(context, 100));
 
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0xE6000000);
-        bg.setCornerRadius(dp(context, 8));
-        bg.setStroke(dp(context, 2), 0xFFFFFFFF);
+        bg.setColor(0xEEB00020);
+        bg.setCornerRadius(dp(context, 6));
+        bg.setStroke(dp(context, 2), Color.WHITE);
         label.setBackground(bg);
         return label;
     }
@@ -247,15 +339,15 @@ public final class InstantsDownloadHook {
         } catch (Throwable ignored) {
         }
 
-        if (title.length() > 80) title = title.substring(0, 80);
+        if (title.length() > 70) title = title.substring(0, 70);
         String rootName = root.getClass().getSimpleName();
         if (rootName == null || rootName.isEmpty()) rootName = root.getClass().getName();
 
         StringBuilder out = new StringBuilder();
         out.append("W").append(id);
         if (secure) out.append(" [SECURE]");
-        out.append(" type=").append(type);
-        if (source != null) out.append(" via ").append(source);
+        if (type != -1) out.append(" type=").append(type);
+        if (source != null) out.append("  ").append(source);
         out.append("\n").append(rootName);
         if (!title.isEmpty()) out.append("\n").append(title);
         return out.toString();
