@@ -39,4 +39,4 @@ jobs:
           fail_on_unmatched_files: true
 
 # Test release workflow for the Instant patch.
-# Build trigger for the global Instagram FLAG_SECURE bypass test.
+# Build trigger for the safe Instant window-label diagnostic.
