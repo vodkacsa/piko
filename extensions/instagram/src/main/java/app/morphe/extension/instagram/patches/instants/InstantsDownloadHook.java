@@ -1,267 +1,197 @@
 package app.morphe.extension.instagram.patches.instants;
 
-import android.app.Activity;
 import android.content.Context;
 import android.graphics.Color;
-import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.view.Gravity;
 import android.view.View;
-import android.view.ViewTreeObserver;
+import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.widget.ImageView;
-import android.widget.PopupWindow;
+import android.view.inspector.WindowInspector;
+import android.widget.TextView;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
+import java.util.List;
 import java.util.Map;
+import java.util.WeakHashMap;
 
-import app.morphe.extension.crimera.PikoUtils;
-import app.morphe.extension.crimera.sharedPreference.SharedPref;
-import app.morphe.extension.instagram.constants.Constants;
-import app.morphe.extension.instagram.constants.UI;
-import app.morphe.extension.instagram.entity.MediaData;
-import app.morphe.extension.instagram.patches.download.DownloadUtils;
-import app.morphe.extension.instagram.settings.Settings;
 import app.morphe.extension.shared.Logger;
-import app.morphe.extension.shared.ui.Dim;
 
 @SuppressWarnings("unused")
 public final class InstantsDownloadHook {
-    private static final long INSTANT_ACTIVE_MS = 45_000L;
+    private static final long LABEL_LIFETIME_MS = 45_000L;
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
-    private static volatile String currentId;
-    private static volatile String currentUsername;
-    private static volatile boolean currentVideo;
-    private static volatile String currentUrl;
+    private static final Map<View, Integer> WINDOW_IDS = new WeakHashMap<>();
+    private static final Map<View, TextView> WINDOW_LABELS = new WeakHashMap<>();
+    private static int nextWindowId = 1;
     private static volatile long lastInstantSeenAt;
 
-    private static final Handler MAIN = new Handler(Looper.getMainLooper());
-    private static volatile PopupWindow instantPopup;
-    private static volatile ViewTreeObserver.OnPreDrawListener secureListener;
-    private static volatile View secureListenerRoot;
-
+    /**
+     * Called from the QuickSnap/Instant item constructor.
+     *
+     * This diagnostic build deliberately does NOT touch FLAG_SECURE or SurfaceView security.
+     * It only asks Android for the root views of windows already attached to this process and
+     * draws a small label inside each root's ViewGroupOverlay. That lets us identify which
+     * exact window becomes the Instants viewer without changing the window's behavior.
+     */
     public static void noteInstantMedia(Object media) {
         try {
             if (media == null) return;
-
-            MediaData md = new MediaData(media);
-            String id = safeStr(() -> md.getMediaPkId());
-            if (id == null || id.isEmpty()) return;
-
-            boolean video = safeBool(() -> md.isVideo());
-            String url = video
-                    ? safeStr(() -> md.getVideoLink())
-                    : safeStr(() -> md.getImageLink());
-            if (url == null || !url.startsWith("http")) return;
-
-            currentId = id;
-            currentVideo = video;
-            currentUrl = url;
-            currentUsername = safeStr(() -> md.getUserData().getUsername());
             lastInstantSeenAt = System.currentTimeMillis();
 
-            try {
-                SharedPref.setBooleanPref(Settings.DISABLE_SCREENSHOT_DETECTION.key, true);
-            } catch (Throwable ignored) {
-            }
-
-            scheduleOverlayInstall(100L);
-            scheduleOverlayInstall(300L);
-            scheduleOverlayInstall(650L);
-            scheduleOverlayInstall(1100L);
-            scheduleOverlayInstall(1800L);
-        } catch (Throwable t) {
-            Logger.printException(() -> "Instant media hook failed", t);
-        }
-    }
-
-    /** Globally removes FLAG_SECURE from direct Window flag calls inside Instagram. */
-    public static int stripSecureFlag(int flags) {
-        return flags & ~WindowManager.LayoutParams.FLAG_SECURE;
-    }
-
-    /** Diagnostic build: never allow Instagram to mark a SurfaceView/SurfaceControl secure. */
-    public static boolean stripSecureSurface(boolean secure) {
-        return false;
-    }
-
-    private static void scheduleOverlayInstall(long delayMs) {
-        MAIN.postDelayed(() -> {
-            try {
-                if (!isInstantActive()) return;
-                Activity activity = findCurrentActivity();
-                if (activity != null) {
-                    installScreenshotGuard(activity);
-                    showInstantPopup(activity);
-                }
-            } catch (Throwable t) {
-                Logger.printException(() -> "Instant overlay retry failed", t);
-            }
-        }, delayMs);
-    }
-
-    private static boolean isInstantActive() {
-        long age = System.currentTimeMillis() - lastInstantSeenAt;
-        return currentUrl != null && age >= 0 && age <= INSTANT_ACTIVE_MS;
-    }
-
-    private static void installScreenshotGuard(Activity activity) {
-        try {
-            activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
-            final View decor = activity.getWindow().getDecorView();
-
-            if (secureListenerRoot == decor && secureListener != null) return;
-            removeSecureListener();
-
-            final ViewTreeObserver.OnPreDrawListener[] holder = new ViewTreeObserver.OnPreDrawListener[1];
-            holder[0] = () -> {
-                try {
-                    if (isInstantActive()) {
-                        activity.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
-                    } else {
-                        ViewTreeObserver observer = decor.getViewTreeObserver();
-                        if (observer.isAlive()) observer.removeOnPreDrawListener(holder[0]);
-                        secureListener = null;
-                        secureListenerRoot = null;
-                    }
-                } catch (Throwable ignored) {
-                }
-                return true;
-            };
-
-            secureListener = holder[0];
-            secureListenerRoot = decor;
-            decor.getViewTreeObserver().addOnPreDrawListener(holder[0]);
-        } catch (Throwable t) {
-            Logger.printException(() -> "Instant screenshot guard failed", t);
-        }
-    }
-
-    private static void removeSecureListener() {
-        try {
-            View root = secureListenerRoot;
-            ViewTreeObserver.OnPreDrawListener listener = secureListener;
-            if (root != null && listener != null) {
-                ViewTreeObserver observer = root.getViewTreeObserver();
-                if (observer.isAlive()) observer.removeOnPreDrawListener(listener);
-            }
-        } catch (Throwable ignored) {
-        }
-        secureListener = null;
-        secureListenerRoot = null;
-    }
-
-    private static void showInstantPopup(Activity activity) {
-        try {
-            PopupWindow old = instantPopup;
-            if (old != null && old.isShowing()) {
-                return;
-            }
-
-            Context context = activity;
-            ImageView button = new ImageView(context);
-            UI.setThemedIcon(button, UI.DRAWABLE_DOWNLOAD_ICON);
-            button.setContentDescription("Download Instant");
-            button.setPadding(Dim.dp12, Dim.dp12, Dim.dp12, Dim.dp12);
-            button.setOnClickListener(v -> downloadCurrentInstant(v.getContext()));
-
-            PopupWindow popup = new PopupWindow(
-                    button,
-                    Dim.dp16 * 3,
-                    Dim.dp16 * 3,
-                    false
-            );
-            popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            popup.setOutsideTouchable(false);
-            popup.setTouchable(true);
-            popup.setClippingEnabled(false);
-            popup.setElevation(100_000f);
-
-            View anchor = activity.getWindow().getDecorView();
-            int top = getStatusBarHeight(context) + (Dim.dp16 / 4);
-            int right = Dim.dp16 * 7;
-            popup.showAtLocation(anchor, Gravity.TOP | Gravity.END, right, top);
-            instantPopup = popup;
+            // The Instant window may be attached a few frames after its media item is created.
+            scheduleScan(0L);
+            scheduleScan(100L);
+            scheduleScan(250L);
+            scheduleScan(500L);
+            scheduleScan(900L);
+            scheduleScan(1500L);
+            scheduleScan(2500L);
+            scheduleScan(4000L);
+            scheduleScan(7000L);
 
             MAIN.postDelayed(() -> {
                 try {
-                    if (!isInstantActive() && instantPopup == popup) {
-                        popup.dismiss();
-                        instantPopup = null;
+                    if (System.currentTimeMillis() - lastInstantSeenAt >= LABEL_LIFETIME_MS) {
+                        clearLabels();
                     }
                 } catch (Throwable ignored) {
                 }
-            }, INSTANT_ACTIVE_MS + 750L);
+            }, LABEL_LIFETIME_MS + 1000L);
         } catch (Throwable t) {
-            Logger.printException(() -> "Failed to show Instant download popup", t);
+            Logger.printException(() -> "Instant window diagnostic failed", t);
         }
     }
 
-    private static void downloadCurrentInstant(Context context) {
+    private static void scheduleScan(long delayMs) {
+        MAIN.postDelayed(InstantsDownloadHook::labelAllWindows, delayMs);
+    }
+
+    private static void labelAllWindows() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
+
         try {
-            String url = currentUrl;
-            String id = currentId;
-            if (url == null || id == null || id.isEmpty()) {
-                PikoUtils.toast("No Instant media available");
-                return;
+            List<View> roots = WindowInspector.getGlobalWindowViews();
+            for (View root : roots) {
+                if (!(root instanceof ViewGroup)) continue;
+                ViewGroup group = (ViewGroup) root;
+                group.post(() -> installOrUpdateLabel(group));
             }
-
-            String username = currentUsername;
-            if (username == null || username.isEmpty()) username = "instagram";
-
-            String safeUsername = username.replaceAll("[^A-Za-z0-9._-]", "_");
-            String filename = safeUsername + "_instant_" + id + (currentVideo ? ".mp4" : ".jpg");
-            DownloadUtils.downloadMediaUrl(context, url, Constants.DEFAULT_DM_FOLDER, filename);
-            PikoUtils.toast("Instant saved: " + filename);
         } catch (Throwable t) {
-            Logger.printException(() -> "Instant download failed", t);
+            Logger.printException(() -> "WindowInspector scan failed", t);
         }
     }
 
-    private static int getStatusBarHeight(Context context) {
+    private static void installOrUpdateLabel(ViewGroup root) {
         try {
-            int id = context.getResources().getIdentifier("status_bar_height", "dimen", "android");
-            return id > 0 ? context.getResources().getDimensionPixelSize(id) : 0;
-        } catch (Throwable ignored) {
-            return 0;
-        }
-    }
+            final int id;
+            TextView label;
 
-    private static Activity findCurrentActivity() {
-        try {
-            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
-            Method currentActivityThread = activityThreadClass.getDeclaredMethod("currentActivityThread");
-            currentActivityThread.setAccessible(true);
-            Object activityThread = currentActivityThread.invoke(null);
-            if (activityThread == null) return null;
+            synchronized (WINDOW_IDS) {
+                Integer existingId = WINDOW_IDS.get(root);
+                if (existingId == null) {
+                    existingId = nextWindowId++;
+                    WINDOW_IDS.put(root, existingId);
+                }
+                id = existingId;
 
-            Field activitiesField = activityThreadClass.getDeclaredField("mActivities");
-            activitiesField.setAccessible(true);
-            Object activitiesObject = activitiesField.get(activityThread);
-            if (!(activitiesObject instanceof Map)) return null;
-
-            for (Object record : ((Map<?, ?>) activitiesObject).values()) {
-                try {
-                    Field pausedField = record.getClass().getDeclaredField("paused");
-                    pausedField.setAccessible(true);
-                    if (pausedField.getBoolean(record)) continue;
-
-                    Field activityField = record.getClass().getDeclaredField("activity");
-                    activityField.setAccessible(true);
-                    Object activity = activityField.get(record);
-                    if (activity instanceof Activity) return (Activity) activity;
-                } catch (Throwable ignored) {
+                label = WINDOW_LABELS.get(root);
+                if (label == null) {
+                    label = createLabel(root.getContext());
+                    WINDOW_LABELS.put(root, label);
+                    root.getOverlay().add(label);
                 }
             }
-        } catch (Throwable ignored) {
+
+            label.setText(describeWindow(root, id));
+
+            int maxWidth = Math.max(dp(root.getContext(), 220), root.getWidth() - dp(root.getContext(), 24));
+            label.measure(
+                    View.MeasureSpec.makeMeasureSpec(maxWidth, View.MeasureSpec.AT_MOST),
+                    View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+            );
+
+            int left = dp(root.getContext(), 12);
+            int top = dp(root.getContext(), 48);
+            int width = label.getMeasuredWidth();
+            int height = label.getMeasuredHeight();
+            label.layout(left, top, left + width, top + height);
+        } catch (Throwable t) {
+            Logger.printException(() -> "Failed to label Instagram window", t);
         }
-        return null;
     }
 
-    private interface StrCall { String get() throws Exception; }
-    private interface BoolCall { boolean get() throws Exception; }
-    private static String safeStr(StrCall call) { try { return call.get(); } catch (Throwable t) { return null; } }
-    private static boolean safeBool(BoolCall call) { try { return call.get(); } catch (Throwable t) { return false; } }
+    private static TextView createLabel(Context context) {
+        TextView label = new TextView(context);
+        label.setTextColor(Color.WHITE);
+        label.setTextSize(14f);
+        label.setPadding(dp(context, 10), dp(context, 7), dp(context, 10), dp(context, 7));
+        label.setClickable(false);
+        label.setFocusable(false);
+        label.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0xE6000000);
+        background.setCornerRadius(dp(context, 8));
+        background.setStroke(dp(context, 2), 0xFFFFFFFF);
+        label.setBackground(background);
+        return label;
+    }
+
+    private static String describeWindow(View root, int id) {
+        boolean secure = false;
+        int type = -1;
+        String title = "";
+
+        try {
+            ViewGroup.LayoutParams params = root.getLayoutParams();
+            if (params instanceof WindowManager.LayoutParams) {
+                WindowManager.LayoutParams windowParams = (WindowManager.LayoutParams) params;
+                secure = (windowParams.flags & WindowManager.LayoutParams.FLAG_SECURE) != 0;
+                type = windowParams.type;
+                CharSequence rawTitle = windowParams.getTitle();
+                if (rawTitle != null) title = rawTitle.toString();
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if (title.length() > 60) title = title.substring(0, 60);
+        String rootName = root.getClass().getSimpleName();
+        if (rootName == null || rootName.isEmpty()) rootName = root.getClass().getName();
+
+        StringBuilder out = new StringBuilder();
+        out.append("W").append(id);
+        if (secure) out.append("  [SECURE]");
+        out.append("  type=").append(type);
+        out.append("\n").append(rootName);
+        if (!title.isEmpty()) out.append("\n").append(title);
+        return out.toString();
+    }
+
+    private static void clearLabels() {
+        MAIN.post(() -> {
+            try {
+                synchronized (WINDOW_IDS) {
+                    for (Map.Entry<View, TextView> entry : WINDOW_LABELS.entrySet()) {
+                        View root = entry.getKey();
+                        TextView label = entry.getValue();
+                        if (root instanceof ViewGroup && label != null) {
+                            try {
+                                ((ViewGroup) root).getOverlay().remove(label);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                    WINDOW_LABELS.clear();
+                }
+            } catch (Throwable ignored) {
+            }
+        });
+    }
+
+    private static int dp(Context context, int value) {
+        return Math.round(value * context.getResources().getDisplayMetrics().density);
+    }
 }
