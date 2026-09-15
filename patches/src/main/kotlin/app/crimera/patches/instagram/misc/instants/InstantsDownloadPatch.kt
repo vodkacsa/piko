@@ -47,6 +47,7 @@ val instantsDownloadPatch = bytecodePatch(
 private fun Opcode.isWindowInvoke(): Boolean =
     this == Opcode.INVOKE_VIRTUAL || this == Opcode.INVOKE_VIRTUAL_RANGE
 
+context(patchContext: BytecodePatchContext)
 private fun patchSecureWindowController(): Int {
     val method = AddFlagsToWindowFingerprint.method
     val targets = method.instructions.mapIndexedNotNull { index, instruction ->
