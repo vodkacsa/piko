@@ -1,7 +1,5 @@
 package app.morphe.extension.instagram.patches.instants;
 
-import android.app.Activity;
-import android.app.Dialog;
 import android.content.Context;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
@@ -11,286 +9,111 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
-import android.widget.PopupWindow;
 import android.widget.TextView;
+import android.widget.Toast;
 
-import java.lang.ref.WeakReference;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 
 @SuppressWarnings("unused")
 public final class InstantsDownloadHook {
-    private static final long ACTIVE_MS = 30_000L;
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
-
-    private static final Map<View, Integer> IDS = new WeakHashMap<>();
-    private static final Map<View, TextView> LABELS = new WeakHashMap<>();
-    private static final Map<View, String> SOURCES = new WeakHashMap<>();
-    private static final Map<View, WeakReference<Window>> WINDOWS = new WeakHashMap<>();
-
+    private static final Map<Window, Integer> IDS = new WeakHashMap<>();
+    private static final Map<Window, TextView> LABELS = new WeakHashMap<>();
     private static int nextId = 1;
     private static volatile long lastInstantSeenAt;
 
     public static void noteInstantMedia(Object media) {
         if (media == null) return;
         lastInstantSeenAt = System.currentTimeMillis();
-
-        // Scan repeatedly because the Instant viewer is created after the media model.
-        long[] delays = {0L, 50L, 120L, 250L, 500L, 900L, 1500L, 2500L, 4000L, 6500L};
-        for (long delay : delays) {
-            MAIN.postDelayed(InstantsDownloadHook::scanActivitiesAndKnownRoots, delay);
-        }
-
-        MAIN.postDelayed(() -> {
-            if (!isInstantActive()) clearLabels();
-        }, ACTIVE_MS + 1000L);
     }
 
     /**
-     * Receives arbitrary app-side receivers from window-ish calls. Using Object here is
-     * intentional so subclasses/wrappers do not have to resolve to android.view.Window in dex.
+     * Called only from Instagram's own FLAG_SECURE controller, immediately before it invokes
+     * addFlags/setFlags/clearFlags on a concrete Window. Nothing is changed here. We simply
+     * remember and label that exact Window.
      */
-    public static void noteObject(Object object) {
-        if (object == null) return;
-        try {
-            if (object instanceof Window) {
-                noteWindow((Window) object);
-            } else if (object instanceof Activity) {
-                Activity activity = (Activity) object;
-                noteWindow(activity.getWindow());
-            } else if (object instanceof Dialog) {
-                noteDialog((Dialog) object);
-            } else if (object instanceof PopupWindow) {
-                notePopup((PopupWindow) object);
-            } else if (object instanceof View) {
-                noteWindowRoot((View) object);
-            }
-        } catch (Throwable ignored) {
-        }
-    }
-
-    public static void noteWindow(Window window) {
+    public static void noteSecureWindow(Window window) {
         if (window == null) return;
-        try {
-            rememberRoot(window.getDecorView(), "Window", window);
-        } catch (Throwable ignored) {
+
+        final int id;
+        final boolean isNew;
+        synchronized (IDS) {
+            Integer existing = IDS.get(window);
+            if (existing == null) {
+                existing = nextId++;
+                IDS.put(window, existing);
+                isNew = true;
+            } else {
+                isNew = false;
+            }
+            id = existing;
         }
+
+        // The actual flag mutation happens just after this callback. Re-check after the current
+        // call returns so [SECURE] reflects the resulting Window attributes.
+        MAIN.post(() -> showLabel(window, id, isNew));
+        MAIN.postDelayed(() -> showLabel(window, id, false), 40L);
+        MAIN.postDelayed(() -> showLabel(window, id, false), 160L);
+        MAIN.postDelayed(() -> showLabel(window, id, false), 500L);
     }
 
-    public static void noteDialog(Dialog dialog) {
-        if (dialog == null) return;
-        tryDialog(dialog);
-        MAIN.postDelayed(() -> tryDialog(dialog), 60L);
-        MAIN.postDelayed(() -> tryDialog(dialog), 220L);
-    }
-
-    public static void notePopup(PopupWindow popup) {
-        if (popup == null) return;
-        tryPopup(popup);
-        MAIN.postDelayed(() -> tryPopup(popup), 60L);
-        MAIN.postDelayed(() -> tryPopup(popup), 220L);
-    }
-
-    public static void noteWindowRoot(View root) {
-        if (root == null) return;
+    private static void showLabel(Window window, int id, boolean toastIfNew) {
         try {
-            View actual = root.getRootView();
-            rememberRoot(actual != null ? actual : root, "ViewRoot", null);
-        } catch (Throwable ignored) {
-        }
-    }
+            View decor = window.getDecorView();
+            if (decor == null) return;
 
-    private static void tryDialog(Dialog dialog) {
-        try {
-            Window window = dialog.getWindow();
-            if (window != null) rememberRoot(window.getDecorView(), "Dialog", window);
-        } catch (Throwable ignored) {
-        }
-    }
+            WindowManager.LayoutParams attrs = window.getAttributes();
+            boolean secure = attrs != null &&
+                    (attrs.flags & WindowManager.LayoutParams.FLAG_SECURE) != 0;
+            int type = attrs != null ? attrs.type : -1;
+            String title = "";
+            if (attrs != null && attrs.getTitle() != null) title = attrs.getTitle().toString();
+            if (title.length() > 70) title = title.substring(0, 70);
 
-    private static void tryPopup(PopupWindow popup) {
-        try {
-            View content = popup.getContentView();
-            if (content == null) return;
-            View root = content.getRootView();
-            rememberRoot(root != null ? root : content, "PopupWindow", null);
-        } catch (Throwable ignored) {
-        }
-    }
+            String rootName = decor.getClass().getSimpleName();
+            if (rootName == null || rootName.isEmpty()) rootName = decor.getClass().getName();
 
-    private static void scanActivitiesAndKnownRoots() {
-        if (!isInstantActive()) return;
-        scanActivities();
-        refreshKnownRoots();
-    }
+            StringBuilder text = new StringBuilder();
+            text.append("S").append(id);
+            if (secure) text.append(" [SECURE]");
+            text.append(" type=").append(type);
+            text.append("\n").append(rootName);
+            if (!title.isEmpty()) text.append("\n").append(title);
 
-    /**
-     * ActivityThread reflection is used only as a diagnostic fallback. This worked in the
-     * earlier download-button build on the same app, and does not modify any window flags.
-     */
-    private static void scanActivities() {
-        try {
-            Class<?> atClass = Class.forName("android.app.ActivityThread");
-            Method current = atClass.getDeclaredMethod("currentActivityThread");
-            current.setAccessible(true);
-            Object thread = current.invoke(null);
-            if (thread == null) return;
-
-            Field activitiesField = atClass.getDeclaredField("mActivities");
-            activitiesField.setAccessible(true);
-            Object records = activitiesField.get(thread);
-            if (!(records instanceof Map)) return;
-
-            for (Object record : ((Map<?, ?>) records).values()) {
-                if (record == null) continue;
+            if (toastIfNew) {
                 try {
-                    Field activityField = record.getClass().getDeclaredField("activity");
-                    activityField.setAccessible(true);
-                    Object value = activityField.get(record);
-                    if (!(value instanceof Activity)) continue;
-
-                    Activity activity = (Activity) value;
-                    Window window = activity.getWindow();
-                    if (window == null) continue;
-                    View decor = window.getDecorView();
-                    if (decor == null) continue;
-
-                    rememberRoot(decor, "Activity:" + activity.getClass().getSimpleName(), window);
-                    decor.post(() -> scanLargeViewGroups(decor));
+                    Toast.makeText(
+                            decor.getContext().getApplicationContext(),
+                            "Secure-window hook: S" + id + (secure ? " [SECURE]" : "") + "\n" + rootName,
+                            Toast.LENGTH_LONG
+                    ).show();
                 } catch (Throwable ignored) {
                 }
             }
-        } catch (Throwable ignored) {
-        }
-    }
 
-    /**
-     * If Instants is not a second Android Window but a full-screen child container, this finds
-     * and labels those large visible ViewGroups too. Only a small number are labelled.
-     */
-    private static void scanLargeViewGroups(View decor) {
-        if (!(decor instanceof ViewGroup) || !isInstantActive()) return;
-        int screenW = decor.getWidth();
-        int screenH = decor.getHeight();
-        if (screenW <= 0 || screenH <= 0) return;
-
-        int[] budget = {12};
-        scanLargeViewGroupsRecursive((ViewGroup) decor, screenW, screenH, 0, budget);
-    }
-
-    private static void scanLargeViewGroupsRecursive(
-            ViewGroup group,
-            int screenW,
-            int screenH,
-            int depth,
-            int[] budget
-    ) {
-        if (budget[0] <= 0 || depth > 8 || !group.isShown()) return;
-
-        if (depth > 0 &&
-                group.getWidth() >= (screenW * 3 / 4) &&
-                group.getHeight() >= (screenH * 3 / 4)) {
-            rememberRoot(group, "FullScreenView d=" + depth, null);
-            budget[0]--;
-        }
-
-        for (int i = group.getChildCount() - 1; i >= 0 && budget[0] > 0; i--) {
-            View child = group.getChildAt(i);
-            if (child instanceof ViewGroup) {
-                scanLargeViewGroupsRecursive((ViewGroup) child, screenW, screenH, depth + 1, budget);
-            }
-        }
-    }
-
-    private static void rememberRoot(View candidate, String source, Window window) {
-        if (candidate == null) return;
-        final View root;
-        try {
-            // Preserve explicitly discovered full-screen children, otherwise resolve to top root.
-            if (source != null && source.startsWith("FullScreenView")) {
-                root = candidate;
-            } else {
-                View resolved = candidate.getRootView();
-                root = resolved != null ? resolved : candidate;
-            }
-        } catch (Throwable ignored) {
-            return;
-        }
-
-        synchronized (IDS) {
-            if (!IDS.containsKey(root)) IDS.put(root, nextId++);
-            SOURCES.put(root, source);
-            if (window != null) WINDOWS.put(root, new WeakReference<>(window));
-        }
-
-        if (isInstantActive()) root.post(() -> installOrUpdateLabel(root));
-    }
-
-    private static boolean isInstantActive() {
-        long age = System.currentTimeMillis() - lastInstantSeenAt;
-        return age >= 0 && age <= ACTIVE_MS;
-    }
-
-    private static void refreshKnownRoots() {
-        final List<View> roots;
-        synchronized (IDS) {
-            roots = new ArrayList<>(IDS.keySet());
-        }
-
-        for (View root : roots) {
-            if (root == null) continue;
-            try {
-                root.post(() -> installOrUpdateLabel(root));
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
-    private static void installOrUpdateLabel(View root) {
-        if (!(root instanceof ViewGroup) || !isInstantActive() || !root.isShown()) return;
-
-        try {
-            ViewGroup group = (ViewGroup) root;
-            final int id;
-            final String source;
-            final Window window;
+            if (!(decor instanceof ViewGroup)) return;
+            ViewGroup group = (ViewGroup) decor;
             TextView label;
 
             synchronized (IDS) {
-                Integer found = IDS.get(root);
-                if (found == null) {
-                    found = nextId++;
-                    IDS.put(root, found);
-                }
-                id = found;
-                source = SOURCES.get(root);
-                WeakReference<Window> ref = WINDOWS.get(root);
-                window = ref != null ? ref.get() : null;
-
-                label = LABELS.get(root);
+                label = LABELS.get(window);
                 if (label == null) {
-                    label = createLabel(root.getContext());
-                    LABELS.put(root, label);
+                    label = createLabel(decor.getContext());
+                    LABELS.put(window, label);
                     group.getOverlay().add(label);
                 }
             }
 
-            label.setText(describe(root, window, id, source));
-
-            int maxWidth = Math.max(dp(root.getContext(), 240), root.getWidth() - dp(root.getContext(), 16));
+            label.setText(text.toString());
+            int maxWidth = Math.max(dp(decor.getContext(), 260), decor.getWidth() - dp(decor.getContext(), 16));
             label.measure(
                     View.MeasureSpec.makeMeasureSpec(maxWidth, View.MeasureSpec.AT_MOST),
                     View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
             );
 
-            // Spread overlapping full-screen candidates vertically so several IDs stay visible.
-            int left = dp(root.getContext(), 8);
-            int slot = (id - 1) % 8;
-            int top = dp(root.getContext(), 38 + slot * 42);
+            int left = dp(decor.getContext(), 10);
+            int top = dp(decor.getContext(), 54 + ((id - 1) % 5) * 58);
             int width = label.getMeasuredWidth();
             int height = label.getMeasuredHeight();
             label.layout(left, top, left + width, top + height);
@@ -303,72 +126,18 @@ public final class InstantsDownloadHook {
     private static TextView createLabel(Context context) {
         TextView label = new TextView(context);
         label.setTextColor(Color.WHITE);
-        label.setTextSize(13f);
-        label.setPadding(dp(context, 9), dp(context, 6), dp(context, 9), dp(context, 6));
+        label.setTextSize(15f);
+        label.setPadding(dp(context, 10), dp(context, 7), dp(context, 10), dp(context, 7));
         label.setClickable(false);
         label.setFocusable(false);
         label.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
 
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0xEEB00020);
-        bg.setCornerRadius(dp(context, 6));
+        bg.setColor(0xEE7B001C);
+        bg.setCornerRadius(dp(context, 7));
         bg.setStroke(dp(context, 2), Color.WHITE);
         label.setBackground(bg);
         return label;
-    }
-
-    private static String describe(View root, Window window, int id, String source) {
-        boolean secure = false;
-        int type = -1;
-        String title = "";
-
-        try {
-            WindowManager.LayoutParams params = null;
-            if (window != null) {
-                params = window.getAttributes();
-            } else if (root.getLayoutParams() instanceof WindowManager.LayoutParams) {
-                params = (WindowManager.LayoutParams) root.getLayoutParams();
-            }
-
-            if (params != null) {
-                secure = (params.flags & WindowManager.LayoutParams.FLAG_SECURE) != 0;
-                type = params.type;
-                CharSequence rawTitle = params.getTitle();
-                if (rawTitle != null) title = rawTitle.toString();
-            }
-        } catch (Throwable ignored) {
-        }
-
-        if (title.length() > 70) title = title.substring(0, 70);
-        String rootName = root.getClass().getSimpleName();
-        if (rootName == null || rootName.isEmpty()) rootName = root.getClass().getName();
-
-        StringBuilder out = new StringBuilder();
-        out.append("W").append(id);
-        if (secure) out.append(" [SECURE]");
-        if (type != -1) out.append(" type=").append(type);
-        if (source != null) out.append("  ").append(source);
-        out.append("\n").append(rootName);
-        if (!title.isEmpty()) out.append("\n").append(title);
-        return out.toString();
-    }
-
-    private static void clearLabels() {
-        MAIN.post(() -> {
-            synchronized (IDS) {
-                for (Map.Entry<View, TextView> entry : LABELS.entrySet()) {
-                    View root = entry.getKey();
-                    TextView label = entry.getValue();
-                    if (root instanceof ViewGroup && label != null) {
-                        try {
-                            ((ViewGroup) root).getOverlay().remove(label);
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                }
-                LABELS.clear();
-            }
-        });
     }
 
     private static int dp(Context context, int value) {
