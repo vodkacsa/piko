@@ -38,6 +38,7 @@ public class UserProfileButton {
     public static void addButtons(ViewGroup viewGroup, Object object) {
         try {
             ProfileInfo profileInfo = new ProfileInfo(object);
+            PfpTweaks.bind(viewGroup, profileInfo);
             Boolean isSelfProfile = profileInfo.isSelfProfile();
 
             if (!isSettingsInActionBar && isSelfProfile){
