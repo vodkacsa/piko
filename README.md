@@ -66,6 +66,28 @@ To patch with Twitter/X version 11.88 to 12.4, you must include patches from ano
 
 </details>
 
+## 🧪 Fast local Instagram test build
+
+For testing Piko changes without patching on your phone, use the included Windows helper:
+
+```bat
+patch-instagram.bat "C:\path\to\instagram.apkm"
+```
+
+It builds the current local Piko patch bundle, downloads/caches the latest Morphe Desktop CLI, patches Instagram on the PC, and writes:
+
+```text
+out\Instagram-Piko-test.apk
+```
+
+To install directly over ADB:
+
+```bat
+patch-instagram.bat "C:\path\to\instagram.apkm" -Install
+```
+
+Morphe reuses a stable signing key on the same PC, so later test APKs can update the previous PC-built test install. If you want to reuse a Morphe signing key exported from another device, pass it from PowerShell with `-Keystore`.
+
 ## ⚙️ Patch Details
 
 <!-- PATCHES_START -->
