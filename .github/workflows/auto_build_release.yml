@@ -32,6 +32,9 @@ jobs:
         run: chmod +x ./gradlew
 
       - name: Build Piko patches
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./gradlew clean buildAndroid
 
       - name: Collect patch bundle
