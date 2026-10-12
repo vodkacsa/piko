@@ -10,6 +10,7 @@ import android.view.ViewGroup;
 import java.util.Set;
 
 import app.morphe.extension.shared.Logger;
+import app.morphe.extension.shared.ui.Dim;
 import app.morphe.extension.instagram.entity.ProfileInfo;
 import app.morphe.extension.instagram.utils.Pref;
 import app.morphe.extension.instagram.constants.UI;
@@ -41,10 +42,14 @@ public class UserProfileButton {
             PfpTweaks.bind(viewGroup, profileInfo);
             Boolean isSelfProfile = profileInfo.isSelfProfile();
 
-            if (!isSettingsInActionBar && isSelfProfile){
-                UI.pikoSettingsButton(viewGroup);
+            boolean showSettings = !isSettingsInActionBar && isSelfProfile;
+            boolean showProfileOptions = !userProfileABPref.contains(Constants.AB_PROFILE_INFO_ICON)
+                    && Pref.isMoreOptionsOnProfilePatched();
+
+            if (showSettings){
+                UI.pikoSettingsButton(viewGroup, showProfileOptions ? 0 : Dim.dp8);
             }
-            if(!userProfileABPref.contains(Constants.AB_PROFILE_INFO_ICON) && Pref.isMoreOptionsOnProfilePatched()){
+            if(showProfileOptions){
                 ProfileMoreOption.addProfileMoreOptionsButton(viewGroup, profileInfo);
             }
         } catch (Exception e) {
